@@ -4,12 +4,21 @@
 // waiting for Pluto's client-side "loading" progress bar to actually finish
 // before printing (a plain `chromium --print-to-pdf` fires on window.onload,
 // long before Pluto has parsed/rendered the baked cell outputs).
+//
+// Chromium's normal paginated `format: "A4"` print layout inserts a blank
+// leading page for Pluto's notebook shell (some CSS interaction with the
+// editor's flex layout / fixed-position ToC -- print pagination, not
+// screen layout, is affected). We sidestep the whole pagination engine by
+// printing to a single page sized to the notebook's actual rendered
+// height instead of paginating it.
 const { chromium } = require("playwright");
 const path = require("path");
 const fs = require("fs");
 
+const VIEWPORT_WIDTH = 1400;
+
 async function renderOne(browser, baseUrl, htmlFile, pdfPath) {
-  const page = await browser.newPage({ viewport: { width: 1400, height: 1600 } });
+  const page = await browser.newPage({ viewport: { width: VIEWPORT_WIDTH, height: 1600 } });
   const url = baseUrl + "/" + htmlFile;
   await page.goto(url, { waitUntil: "load", timeout: 120000 });
 
@@ -24,14 +33,35 @@ async function renderOne(browser, baseUrl, htmlFile, pdfPath) {
   // extra settle time for plot / katex rendering
   await page.waitForTimeout(6000);
 
+  const contentHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+
   fs.mkdirSync(path.dirname(pdfPath), { recursive: true });
-  await page.pdf({
-    path: pdfPath,
-    format: "A4",
-    printBackground: true,
-    margin: { top: "12mm", bottom: "12mm", left: "10mm", right: "10mm" },
-  });
+
+  // Chromium's px->pt rounding can push a sliver of content onto a second
+  // page even when height == scrollHeight exactly; pad until it settles on
+  // a single page rather than risk cropping real content.
+  let pad = 8;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    await page.pdf({
+      path: pdfPath,
+      printBackground: true,
+      width: `${VIEWPORT_WIDTH}px`,
+      height: `${contentHeight + pad}px`,
+    });
+    if (countPdfPages(pdfPath) === 1) {
+      await page.close();
+      return;
+    }
+    pad *= 4;
+  }
   await page.close();
+  throw new Error(`${pdfPath}: could not settle on a single page (content height ${contentHeight})`);
+}
+
+function countPdfPages(pdfPath) {
+  const buf = fs.readFileSync(pdfPath, "latin1");
+  const matches = buf.match(/\/Type\s*\/Page[^s]/g);
+  return matches ? matches.length : 0;
 }
 
 async function main() {
