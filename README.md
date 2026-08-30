@@ -27,6 +27,9 @@ so the scaling argument for additive updates is visible, not just claimed.
 
 ## Results (from the shipped PDFs)
 
+Notebook 1 (permeability regression): held-out-well **R² = 0.90**, RMSE =
+0.19 in log10(mD) space.
+
 | | RMSE (pooled held-out test) | R² | wells processed *this step* |
 |---|---|---|---|
 | Stale (Phase A only, distribution-shifted Phase B never seen) | 0.313 | −0.18 | — |
