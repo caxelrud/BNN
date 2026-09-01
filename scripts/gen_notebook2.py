@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
+import os
 import sys
-sys.path.insert(0, "/home/user/bnn/scripts")
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_DIR = os.path.dirname(SCRIPT_DIR)
+sys.path.insert(0, SCRIPT_DIR)
 from pluto_build import write_notebook
 
 cells = []
@@ -29,6 +33,10 @@ architecture as `01_bnn_permeability_regression.jl`:
 3. **Full retrain** — NUTS run from scratch on Phase A ∪ Phase B pooled
    together — the expensive gold standard the additive update is trying to
    approximate.
+
+A final section then asks: how much should the new batch count? It sweeps
+a *prior inflation* factor `τ` that controls how strongly Phase A's
+posterior constrains the additive fit on Phase B.
 """''')
 
 cells.append('''begin
@@ -275,7 +283,76 @@ of testing additive capability.
 """''')
 
 cells.append('''md"""
-## 7. Posterior predictive on a Phase B well: stale vs. additive vs. retrain
+## 7. Tuning how much the new data counts: prior inflation τ
+
+The additive update above used Phase A's posterior *as-is* for a prior. But
+that prior can be made more or less informative before folding in Phase B:
+inflating its covariance by a factor `τ` is a **power prior**
+(``p(\\theta) \\propto p(\\theta \\mid A)^{1/\\tau}``) — it keeps the same
+mean but loosens how tightly it constrains the fit, letting Phase B's
+likelihood dominate more as `τ` grows. `τ = 1` reproduces the additive
+update computed above exactly.
+"""''')
+
+cells.append('''begin
+	τ_grid = [1.0, 2.0, 4.0, 8.0]
+
+	function fit_additive(τ)
+		τ == 1.0 && return chainB_additive, t_update
+		Random.seed!(2)
+		t = @elapsed chain = sample(
+			bayes_nn2(XB_train', yB_train, post_mean_A, post_cov_A .* τ), NUTS(0.8), 250;
+			progress=false, chain_type=Chains)
+		chain, t
+	end
+
+	τ_rows = map(τ_grid) do τ
+		chain_τ, t_τ = fit_additive(τ)
+		θτ = Array(group(chain_τ, :θ))'
+		res_A      = rmse_r2(nn_forward2, θτ, XA_test, yA_test)
+		res_B      = rmse_r2(nn_forward2, θτ, XB_test, yB_test)
+		res_pooled = rmse_r2(nn_forward2, θτ, Xall_test, yall_test)
+		(τ=τ, rmse_A_test=round(res_A.rmse, digits=3), rmse_B_test=round(res_B.rmse, digits=3),
+		 rmse_pooled=round(res_pooled.rmse, digits=3), r2_pooled=round(res_pooled.r2, digits=3),
+		 mcmc_seconds=round(t_τ, digits=1))
+	end
+
+	tau_comparison = DataFrame(τ_rows)
+end''')
+
+cells.append('''begin
+	plot(tau_comparison.τ, tau_comparison.rmse_A_test, marker=:circle, linewidth=2,
+		label="RMSE on Phase A test", xlabel="prior inflation τ", ylabel="RMSE (log EUR)",
+		xscale=:log2, title="Prior inflation trades old-data fit for new-data fit", size=(650,450))
+	plot!(tau_comparison.τ, tau_comparison.rmse_B_test, marker=:diamond, linewidth=2,
+		label="RMSE on Phase B test")
+end''')
+
+cells.append('''md"""
+**Reading the sweep.** The "textbook" expectation is a trade: as `τ`
+grows, `rmse_B_test` should fall (the fit leans harder into the new,
+shifted data) while `rmse_A_test` rises (less of the historical fit
+survives). That is *not* quite what happens here — on this run,
+`rmse_B_test` falls as expected, but `rmse_A_test` improves too (and
+`r2_pooled` climbs from ≈0.24 at `τ=1` to ≈0.37 at `τ=8`, at the cost of
+`mcmc_seconds` roughly tripling). The reason: `post_mean_A` is itself a
+noisy point estimate from only ~30 Phase A wells fit to a 56-parameter
+network, so it is not tightly identified even for Phase A's *own*
+held-out wells — loosening the prior around it gives NUTS room to find a
+fit that is jointly better on both regimes, not purely a trade. With a
+larger, better-identified Phase A posterior you would expect the classic
+old-vs-new trade-off to show up more clearly. Either way, `τ` is the
+practical knob for "how much do I trust this new batch", and it is not
+free: check `mcmc_seconds` before assuming a larger `τ` is a free lunch.
+If you run *many* additive rounds over time, applying a modest `τ > 1` at
+every round is also the standard fix for a failure mode of naive
+sequential Bayes: the prior covariance keeps shrinking round over round
+until the model becomes overconfident and stops updating even when new
+data disagrees with it.
+"""''')
+
+cells.append('''md"""
+## 8. Posterior predictive on a Phase B well: stale vs. additive vs. retrain
 """''')
 
 cells.append('''begin
@@ -309,7 +386,7 @@ cells.append('''begin
 end''')
 
 cells.append('''md"""
-## 8. Discussion & caveats
+## 9. Discussion & caveats
 
 * **What worked.** Sequential Bayesian updating — moment-matching the old
   posterior into a new prior and running MCMC on only the incoming batch —
@@ -329,6 +406,11 @@ cells.append('''md"""
 * **Caveat — this is not online/streaming SGD.** Each "update" here is
   still a batch MCMC run (just a cheaper one, over less data with a
   tighter, informative prior) — not a single-sample online update.
+* **Tuning old-vs-new trust.** Section 7's `τ` sweep is the explicit knob
+  for how much the new batch should count relative to the carried-forward
+  prior — useful when you have a specific reason to believe the new wells
+  either are noisy/small and shouldn't move the model much (`τ ≈ 1`), or
+  reflect a real, lasting shift worth trusting more (`τ` larger).
 """''')
 
-write_notebook("/home/user/bnn/notebooks/02_additive_bayesian_updating.jl", cells)
+write_notebook(os.path.join(REPO_DIR, "notebooks/02_additive_bayesian_updating.jl"), cells)

@@ -1,10 +1,23 @@
 ### A Pluto.jl notebook ###
-# v0.19.45
+# v0.20.21
 
 using Markdown
 using InteractiveUtils
 
-# ╔═╡ b14e9022-7aa5-4d81-a3ea-941ec77c698b
+# ╔═╡ 8b983177-4105-4490-b705-590329f7f163
+begin
+	using Turing
+	using MCMCChains
+	using Distributions
+	using Random
+	using LinearAlgebra
+	using StatsPlots
+	using Plots
+	using DataFrames
+	using PlutoUI
+end
+
+# ╔═╡ 9aeac5b8-3a66-434b-bd98-5bdd7df22f55
 md"""
 # Additive (Incremental) Bayesian Updating for a BNN — Oil & Gas Field Expansion
 
@@ -29,25 +42,16 @@ architecture as `01_bnn_permeability_regression.jl`:
 3. **Full retrain** — NUTS run from scratch on Phase A ∪ Phase B pooled
    together — the expensive gold standard the additive update is trying to
    approximate.
+
+A final section then asks: how much should the new batch count? It sweeps
+a *prior inflation* factor `τ` that controls how strongly Phase A's
+posterior constrains the additive fit on Phase B.
 """
 
-# ╔═╡ 1d336656-a3ea-45be-83aa-808adba53dc2
-begin
-	using Turing
-	using MCMCChains
-	using Distributions
-	using Random
-	using LinearAlgebra
-	using StatsPlots
-	using Plots
-	using DataFrames
-	using PlutoUI
-end
-
-# ╔═╡ fc9d63a1-d80e-4846-8296-9919049ffac2
+# ╔═╡ 87515d6c-b1e7-4ebd-8274-05aad9c19a68
 TableOfContents()
 
-# ╔═╡ 0ca3eca9-6062-4073-b2e9-9690ffff2360
+# ╔═╡ 2543c334-d419-487e-a9b9-fd536d8c3785
 md"""
 ## 1. Synthetic production data: two field-development phases
 
@@ -64,7 +68,7 @@ Arps decline rate `Di` (1/yr) and reservoir permeability `K` (mD).
   retraining" matters operationally.
 """
 
-# ╔═╡ 517e540e-d290-4f2c-bf3e-08cd4db13b71
+# ╔═╡ 4916dddd-0363-4aa0-a30a-fc4e4791df6a
 function generate_phase(n::Int; seed::Int, quality_shift::Float64)
 	rng = MersenneTwister(seed)
 	qi = rand(rng, LogNormal(log(600.0), 0.35), n)          # initial rate, bbl/d
@@ -81,7 +85,7 @@ function generate_phase(n::Int; seed::Int, quality_shift::Float64)
 	DataFrame(QI=qi, DI=Di, K=K, EUR=eur, LOGEUR=log.(eur))
 end
 
-# ╔═╡ 5c8092b2-da3f-475c-bdab-857f349e92c4
+# ╔═╡ 4a7337a7-1f18-4551-a581-4d3767df372f
 begin
 	Random.seed!(2024)
 	phaseA = generate_phase(40; seed=101, quality_shift=0.0)    # core area
@@ -89,14 +93,14 @@ begin
 	(nA=nrow(phaseA), nB=nrow(phaseB))
 end
 
-# ╔═╡ c858bbe9-1e8f-4f6f-a1db-076c33f168ed
+# ╔═╡ 3c32bd56-768e-4fec-8811-1981a7ce65cb
 begin
 	@df phaseA scatter(:K, :EUR, label="Phase A (core)", xlabel="permeability K (mD)",
 		ylabel="EUR (Mbbl)", yscale=:log10, xscale=:log10, markersize=4, alpha=0.7, size=(650,450))
 	@df phaseB scatter!(:K, :EUR, label="Phase B (step-out)", markersize=4, alpha=0.7, markershape=:diamond)
 end
 
-# ╔═╡ e57f5f48-be04-430a-8f64-bd532ebd6871
+# ╔═╡ e05034a9-686f-4cbe-b11b-2c6fc7496324
 md"""
 ## 2. Shared BNN architecture & Turing model
 
@@ -107,7 +111,7 @@ explicit `prior_mean` / `prior_cov` so it can be reused both for a vague
 distribution.
 """
 
-# ╔═╡ fd3381f5-0ff4-4ed2-a658-03fabd29847e
+# ╔═╡ a72c1070-ec7a-4ab9-8a5e-087af12bb829
 begin
 	FEATURES2 = [:QI, :DI, :K]
 	N_IN2, N_H1_2, N_H2_2 = 3, 5, 5
@@ -133,14 +137,14 @@ begin
 	N_PARAMS2
 end
 
-# ╔═╡ 7dc74961-9542-43ae-b22b-939406bf78ec
+# ╔═╡ 4d73ee31-728c-4318-b7ae-3519843dadc7
 @model function bayes_nn2(X, y, prior_mean, prior_cov; obs_sigma=0.25)
 	θ ~ MvNormal(prior_mean, prior_cov)
 	preds = nn_forward2(X, θ)
 	y ~ MvNormal(preds, obs_sigma^2 * I(length(y)))
 end
 
-# ╔═╡ 98a38d88-6fce-4949-b9cf-06941fec3733
+# ╔═╡ f2205061-836d-48c3-9d66-51d666f3ce75
 md"""
 ### Feature standardization
 
@@ -149,7 +153,7 @@ later, "in production", so nothing about it may leak into preprocessing
 decided when the original model was built.
 """
 
-# ╔═╡ 80432d1a-f665-4e7a-affd-fec8674598aa
+# ╔═╡ d37fc21a-e817-4cb9-b7bc-f1bc1062f793
 begin
 	function tt_split(df; frac_train=0.75, seed=1)
 		rng = MersenneTwister(seed)
@@ -173,12 +177,12 @@ begin
 	(nA_train=length(yA_train), nA_test=length(yA_test), nB_train=length(yB_train), nB_test=length(yB_test))
 end
 
-# ╔═╡ d3cce94a-b4bd-4837-8065-7e1c5e78757f
+# ╔═╡ 778210a6-28ca-48c3-8492-1999f8694a02
 md"""
 ## 3. Step 1 — fit the initial ("stale") model on Phase A only
 """
 
-# ╔═╡ de86d627-e0f4-414b-9683-b0f7bbb62081
+# ╔═╡ a5ebbe58-6f54-4b07-b9d6-298de7719844
 begin
 	Random.seed!(1)
 	vague_mean = zeros(N_PARAMS2)
@@ -189,7 +193,7 @@ begin
 	t_fitA
 end
 
-# ╔═╡ e90088ea-0ced-4ea2-a21e-c2c15e31b225
+# ╔═╡ 32910327-b150-42d1-b2bb-8933d4cf2d1e
 function rmse_r2(model_forward, θsamples, Xrows, y)
 	Xt = Xrows'  # (n_features, n_obs)
 	preds = reduce(hcat, [model_forward(Xt, θsamples[:, s]) for s in 1:size(θsamples, 2)])
@@ -199,7 +203,7 @@ function rmse_r2(model_forward, θsamples, Xrows, y)
 	(rmse=rmse, r2=1 - ss_res/ss_tot, pred_mean=pmean, preds=preds)
 end
 
-# ╔═╡ fef3bd1a-f975-4cdc-962f-24f7041d3253
+# ╔═╡ c71168a8-161c-4e14-8d8d-fbb5b3753baa
 begin
 	θA = Array(group(chainA, :θ))'
 	stale_on_A = rmse_r2(nn_forward2, θA, XA_test, yA_test)
@@ -207,7 +211,7 @@ begin
 	(rmse_on_A_test=round(stale_on_A.rmse, digits=3), rmse_on_B_test_STALE=round(stale_on_B.rmse, digits=3))
 end
 
-# ╔═╡ 59f4d6d5-d819-4d53-bb3b-3d21849f5d64
+# ╔═╡ 0de9523f-c772-4a36-8ba4-df092eb5de9e
 md"""
 The RMSE jump from Phase A test wells to Phase B test wells (evaluated with
 the *same, unmodified* Phase-A-only model) is the distribution-shift
@@ -215,7 +219,7 @@ penalty of doing nothing. That gap is what an update — additive or full
 retrain — should close.
 """
 
-# ╔═╡ 08cd9e3e-6727-4e67-9fa2-f4ac2ee27aca
+# ╔═╡ 25ccf42d-cc1e-4e2b-97f3-3412d54d5ae0
 md"""
 ## 4. Step 2a — additive update: fold Phase B into the existing posterior
 
@@ -225,7 +229,7 @@ that sees **only Phase B data** — Phase A's raw well data is never touched
 again.
 """
 
-# ╔═╡ d4587680-dd6b-4d54-ab3d-1fe5b01a9c02
+# ╔═╡ f139ea88-876a-4668-90b9-bbb793d66a96
 begin
 	post_mean_A = vec(mean(θA, dims=2))
 	post_cov_A  = cov(θA'; dims=1) + 1e-6 * I(N_PARAMS2)  # jitter for PD-ness
@@ -236,12 +240,12 @@ begin
 	t_update
 end
 
-# ╔═╡ 41f0dc8a-cfa0-4564-81d6-013ca6c57aff
+# ╔═╡ 30292e63-b29d-4db1-ab6a-fbf2b20b917f
 md"""
 ## 5. Step 2b — baseline: full retrain on Phase A ∪ Phase B pooled
 """
 
-# ╔═╡ 1b001a7f-4bb9-4b9e-b80d-644e456cf504
+# ╔═╡ fd9292ea-c8e7-4cc2-a166-8eeb56b24512
 begin
 	Xall_train = vcat(XA_train, XB_train)
 	yall_train = vcat(yA_train, yB_train)
@@ -252,7 +256,7 @@ begin
 	t_retrain
 end
 
-# ╔═╡ 62232c08-d9e4-4964-b3c2-a9eb9a036911
+# ╔═╡ 887aca7e-8d23-4c80-b121-f31ad672ca1e
 md"""
 ## 6. Compare: stale vs. additive update vs. full retrain
 
@@ -260,7 +264,7 @@ All three are evaluated on the *same* held-out mix of Phase A and Phase B
 test wells.
 """
 
-# ╔═╡ d0f66b1c-eab3-4536-b10d-00e8fb255161
+# ╔═╡ c1b8a4c9-a9f6-4a45-9b65-fd70fd118207
 begin
 	Xall_test = vcat(XA_test, XB_test)
 	yall_test = vcat(yA_test, yB_test)
@@ -282,11 +286,11 @@ begin
 	comparison
 end
 
-# ╔═╡ 0f08239d-50b2-426a-abea-7cf816de8ef2
+# ╔═╡ 4f7add61-3614-4cae-86a7-6b87b50c5d24
 @df comparison bar(:model, :rmse, xrotation=15, legend=false, size=(700,420),
 	ylabel="RMSE on pooled held-out wells (log EUR)", title="Additive update recovers most of the full-retrain gain")
 
-# ╔═╡ 07dce462-7adc-4815-be1b-d5ffc0e1e738
+# ╔═╡ d8b4db51-b24d-4727-8130-935411068532
 md"""
 The key comparison is **rows 2 vs. 3**: the additive update reprocesses
 only the `nrow(B_train)` new wells through MCMC (not all
@@ -298,12 +302,85 @@ the full-retrain route grows without bound — that gap is the whole point
 of testing additive capability.
 """
 
-# ╔═╡ 0a528c03-071f-4fd3-a70d-1e47ddbc665e
+# ╔═╡ 4372320c-46b2-415b-bad4-6423fded9e20
 md"""
-## 7. Posterior predictive on a Phase B well: stale vs. additive vs. retrain
+## 7. Tuning how much the new data counts: prior inflation τ
+
+The additive update above used Phase A's posterior *as-is* for a prior. But
+that prior can be made more or less informative before folding in Phase B:
+inflating its covariance by a factor `τ` is a **power prior**
+(``p(\theta) \propto p(\theta \mid A)^{1/\tau}``) — it keeps the same
+mean but loosens how tightly it constrains the fit, letting Phase B's
+likelihood dominate more as `τ` grows. `τ = 1` reproduces the additive
+update computed above exactly.
 """
 
-# ╔═╡ 3cd06812-4725-4f20-b696-145a07810b95
+# ╔═╡ fda488ed-5eb3-4918-a79d-dc397fafe69d
+begin
+	τ_grid = [1.0, 2.0, 4.0, 8.0]
+
+	function fit_additive(τ)
+		τ == 1.0 && return chainB_additive, t_update
+		Random.seed!(2)
+		t = @elapsed chain = sample(
+			bayes_nn2(XB_train', yB_train, post_mean_A, post_cov_A .* τ), NUTS(0.8), 250;
+			progress=false, chain_type=Chains)
+		chain, t
+	end
+
+	τ_rows = map(τ_grid) do τ
+		chain_τ, t_τ = fit_additive(τ)
+		θτ = Array(group(chain_τ, :θ))'
+		res_A      = rmse_r2(nn_forward2, θτ, XA_test, yA_test)
+		res_B      = rmse_r2(nn_forward2, θτ, XB_test, yB_test)
+		res_pooled = rmse_r2(nn_forward2, θτ, Xall_test, yall_test)
+		(τ=τ, rmse_A_test=round(res_A.rmse, digits=3), rmse_B_test=round(res_B.rmse, digits=3),
+		 rmse_pooled=round(res_pooled.rmse, digits=3), r2_pooled=round(res_pooled.r2, digits=3),
+		 mcmc_seconds=round(t_τ, digits=1))
+	end
+
+	tau_comparison = DataFrame(τ_rows)
+end
+
+# ╔═╡ e1ae99e6-4079-4d8a-8fb8-3faec1dcfe46
+begin
+	plot(tau_comparison.τ, tau_comparison.rmse_A_test, marker=:circle, linewidth=2,
+		label="RMSE on Phase A test", xlabel="prior inflation τ", ylabel="RMSE (log EUR)",
+		xscale=:log2, title="Prior inflation trades old-data fit for new-data fit", size=(650,450))
+	plot!(tau_comparison.τ, tau_comparison.rmse_B_test, marker=:diamond, linewidth=2,
+		label="RMSE on Phase B test")
+end
+
+# ╔═╡ 16f4fe1e-8a88-4b25-b129-e5216e148762
+md"""
+**Reading the sweep.** The "textbook" expectation is a trade: as `τ`
+grows, `rmse_B_test` should fall (the fit leans harder into the new,
+shifted data) while `rmse_A_test` rises (less of the historical fit
+survives). That is *not* quite what happens here — on this run,
+`rmse_B_test` falls as expected, but `rmse_A_test` improves too (and
+`r2_pooled` climbs from ≈0.24 at `τ=1` to ≈0.37 at `τ=8`, at the cost of
+`mcmc_seconds` roughly tripling). The reason: `post_mean_A` is itself a
+noisy point estimate from only ~30 Phase A wells fit to a 56-parameter
+network, so it is not tightly identified even for Phase A's *own*
+held-out wells — loosening the prior around it gives NUTS room to find a
+fit that is jointly better on both regimes, not purely a trade. With a
+larger, better-identified Phase A posterior you would expect the classic
+old-vs-new trade-off to show up more clearly. Either way, `τ` is the
+practical knob for "how much do I trust this new batch", and it is not
+free: check `mcmc_seconds` before assuming a larger `τ` is a free lunch.
+If you run *many* additive rounds over time, applying a modest `τ > 1` at
+every round is also the standard fix for a failure mode of naive
+sequential Bayes: the prior covariance keeps shrinking round over round
+until the model becomes overconfident and stops updating even when new
+data disagrees with it.
+"""
+
+# ╔═╡ 4097af08-6914-45ac-88d7-8a76d1c7aa12
+md"""
+## 8. Posterior predictive on a Phase B well: stale vs. additive vs. retrain
+"""
+
+# ╔═╡ 82a22b74-248a-4423-96ee-9ff79e043a03
 begin
 	k_grid = range(minimum(phaseB.K), maximum(phaseB.K); length=60)
 	qi_med, di_med = median(B_train.QI), median(B_train.DI)
@@ -334,9 +411,9 @@ begin
 	plot!(k_grid, m_f, ribbon=(m_f .- lo_f, hi_f .- m_f), label="full retrain", fillalpha=0.18, linestyle=:dash)
 end
 
-# ╔═╡ e08d1c38-0954-463a-847a-1e897e47abdf
+# ╔═╡ 017e5933-ebbb-45fc-bd7d-217ed7060f79
 md"""
-## 8. Discussion & caveats
+## 9. Discussion & caveats
 
 * **What worked.** Sequential Bayesian updating — moment-matching the old
   posterior into a new prior and running MCMC on only the incoming batch —
@@ -356,34 +433,43 @@ md"""
 * **Caveat — this is not online/streaming SGD.** Each "update" here is
   still a batch MCMC run (just a cheaper one, over less data with a
   tighter, informative prior) — not a single-sample online update.
+* **Tuning old-vs-new trust.** Section 7's `τ` sweep is the explicit knob
+  for how much the new batch should count relative to the carried-forward
+  prior — useful when you have a specific reason to believe the new wells
+  either are noisy/small and shouldn't move the model much (`τ ≈ 1`), or
+  reflect a real, lasting shift worth trusting more (`τ` larger).
 """
 
 # ╔═╡ Cell order:
-# ╠═b14e9022-7aa5-4d81-a3ea-941ec77c698b
-# ╠═1d336656-a3ea-45be-83aa-808adba53dc2
-# ╠═fc9d63a1-d80e-4846-8296-9919049ffac2
-# ╠═0ca3eca9-6062-4073-b2e9-9690ffff2360
-# ╠═517e540e-d290-4f2c-bf3e-08cd4db13b71
-# ╠═5c8092b2-da3f-475c-bdab-857f349e92c4
-# ╠═c858bbe9-1e8f-4f6f-a1db-076c33f168ed
-# ╠═e57f5f48-be04-430a-8f64-bd532ebd6871
-# ╠═fd3381f5-0ff4-4ed2-a658-03fabd29847e
-# ╠═7dc74961-9542-43ae-b22b-939406bf78ec
-# ╠═98a38d88-6fce-4949-b9cf-06941fec3733
-# ╠═80432d1a-f665-4e7a-affd-fec8674598aa
-# ╠═d3cce94a-b4bd-4837-8065-7e1c5e78757f
-# ╠═de86d627-e0f4-414b-9683-b0f7bbb62081
-# ╠═e90088ea-0ced-4ea2-a21e-c2c15e31b225
-# ╠═fef3bd1a-f975-4cdc-962f-24f7041d3253
-# ╠═59f4d6d5-d819-4d53-bb3b-3d21849f5d64
-# ╠═08cd9e3e-6727-4e67-9fa2-f4ac2ee27aca
-# ╠═d4587680-dd6b-4d54-ab3d-1fe5b01a9c02
-# ╠═41f0dc8a-cfa0-4564-81d6-013ca6c57aff
-# ╠═1b001a7f-4bb9-4b9e-b80d-644e456cf504
-# ╠═62232c08-d9e4-4964-b3c2-a9eb9a036911
-# ╠═d0f66b1c-eab3-4536-b10d-00e8fb255161
-# ╠═0f08239d-50b2-426a-abea-7cf816de8ef2
-# ╠═07dce462-7adc-4815-be1b-d5ffc0e1e738
-# ╠═0a528c03-071f-4fd3-a70d-1e47ddbc665e
-# ╠═3cd06812-4725-4f20-b696-145a07810b95
-# ╠═e08d1c38-0954-463a-847a-1e897e47abdf
+# ╠═9aeac5b8-3a66-434b-bd98-5bdd7df22f55
+# ╠═8b983177-4105-4490-b705-590329f7f163
+# ╠═87515d6c-b1e7-4ebd-8274-05aad9c19a68
+# ╠═2543c334-d419-487e-a9b9-fd536d8c3785
+# ╠═4916dddd-0363-4aa0-a30a-fc4e4791df6a
+# ╠═4a7337a7-1f18-4551-a581-4d3767df372f
+# ╠═3c32bd56-768e-4fec-8811-1981a7ce65cb
+# ╠═e05034a9-686f-4cbe-b11b-2c6fc7496324
+# ╠═a72c1070-ec7a-4ab9-8a5e-087af12bb829
+# ╠═4d73ee31-728c-4318-b7ae-3519843dadc7
+# ╠═f2205061-836d-48c3-9d66-51d666f3ce75
+# ╠═d37fc21a-e817-4cb9-b7bc-f1bc1062f793
+# ╠═778210a6-28ca-48c3-8492-1999f8694a02
+# ╠═a5ebbe58-6f54-4b07-b9d6-298de7719844
+# ╠═32910327-b150-42d1-b2bb-8933d4cf2d1e
+# ╠═c71168a8-161c-4e14-8d8d-fbb5b3753baa
+# ╠═0de9523f-c772-4a36-8ba4-df092eb5de9e
+# ╠═25ccf42d-cc1e-4e2b-97f3-3412d54d5ae0
+# ╠═f139ea88-876a-4668-90b9-bbb793d66a96
+# ╠═30292e63-b29d-4db1-ab6a-fbf2b20b917f
+# ╠═fd9292ea-c8e7-4cc2-a166-8eeb56b24512
+# ╠═887aca7e-8d23-4c80-b121-f31ad672ca1e
+# ╠═c1b8a4c9-a9f6-4a45-9b65-fd70fd118207
+# ╠═4f7add61-3614-4cae-86a7-6b87b50c5d24
+# ╠═d8b4db51-b24d-4727-8130-935411068532
+# ╠═4372320c-46b2-415b-bad4-6423fded9e20
+# ╠═fda488ed-5eb3-4918-a79d-dc397fafe69d
+# ╠═e1ae99e6-4079-4d8a-8fb8-3faec1dcfe46
+# ╠═16f4fe1e-8a88-4b25-b129-e5216e148762
+# ╠═4097af08-6914-45ac-88d7-8a76d1c7aa12
+# ╠═82a22b74-248a-4423-96ee-9ff79e043a03
+# ╠═017e5933-ebbb-45fc-bd7d-217ed7060f79

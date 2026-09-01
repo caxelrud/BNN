@@ -23,7 +23,8 @@ rm -rf "$HTML_DIR/frontend-dist"
 cp -r "$SRC" "$HTML_DIR/frontend-dist"
 
 for f in "$HTML_DIR"/*.html; do
-  sed -i "s#https://cdn.jsdelivr.net/gh/JuliaPluto/Pluto.jl@${PLUTO_VERSION}/frontend-dist/#frontend-dist/#g" "$f"
+  sed -i.bak "s#https://cdn.jsdelivr.net/gh/JuliaPluto/Pluto.jl@${PLUTO_VERSION}/frontend-dist/#frontend-dist/#g" "$f"
+  rm -f "$f.bak"
 done
 
 echo "Vendored $SRC -> $HTML_DIR/frontend-dist (Pluto v$PLUTO_VERSION)"
